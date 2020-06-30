@@ -155,7 +155,7 @@ sign_request = (saml_request, private_key, relay_state, response=false) ->
     samlQueryString.RelayState = relay_state
 
   samlQueryString.SigAlg = 'http://www.w3.org/2001/04/xmldsig-more#rsa-sha256'
-  samlQueryString.Signature = sign.sign(format_pem(private_key, 'PRIVATE KEY'), 'base64')
+  samlQueryString.Signature = sign.sign(format_pem(private_key, 'RSA PRIVATE KEY'), 'base64')
 
   samlQueryString
 
@@ -229,7 +229,7 @@ decrypt_assertion = (dom, private_keys, cb) ->
     encrypted_assertion = encrypted_assertion[0].toString()
     errors = []
     async.eachOfSeries private_keys, (private_key, index, cb_e) ->
-      xmlenc.decrypt encrypted_assertion, {key: format_pem(private_key, 'PRIVATE KEY')}, (err, result) ->
+      xmlenc.decrypt encrypted_assertion, {key: format_pem(private_key, 'RSA PRIVATE KEY')}, (err, result) ->
         if err?
           errors.push new Error("Decrypt failed: #{util.inspect err}") if err?
           return cb_e()
