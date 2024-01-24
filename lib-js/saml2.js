@@ -19,7 +19,7 @@ url = require('url');
 
 util = require('util');
 
-xmlbuilder = require('xmlbuilder2');
+xmlbuilder = require('xmlbuilder');
 
 xmlcrypto = require('xml-crypto');
 
@@ -56,10 +56,14 @@ SAMLError = (function(superClass) {
 create_authn_request = function(issuer, assert_endpoint, destination, force_authn, context, nameid_format) {
   var context_element, id, xml;
   if (context != null) {
-    context_element = {
-      'saml:AuthnContextClassRef': context.class_refs,
+    context_element = _(context.class_refs).map(function(class_ref) {
+      return {
+        'saml:AuthnContextClassRef': class_ref
+      };
+    });
+    context_element.push({
       '@Comparison': context.comparison
-    };
+    });
   }
   id = '_' + crypto.randomBytes(21).toString('hex');
   xml = xmlbuilder.create({
@@ -104,7 +108,9 @@ create_metadata = function(entity_id, assert_endpoint, signing_certificates, enc
     results = [];
     for (j = 0, len = ref1.length; j < len; j++) {
       signing_certificate = ref1[j];
-      results.push(certificate_to_keyinfo('signing', signing_certificate));
+      results.push({
+        'md:KeyDescriptor': certificate_to_keyinfo('signing', signing_certificate)
+      });
     }
     return results;
   })();
@@ -114,7 +120,9 @@ create_metadata = function(entity_id, assert_endpoint, signing_certificates, enc
     results = [];
     for (j = 0, len = ref1.length; j < len; j++) {
       encryption_certificate = ref1[j];
-      results.push(certificate_to_keyinfo('encryption', encryption_certificate));
+      results.push({
+        'md:KeyDescriptor': certificate_to_keyinfo('encryption', encryption_certificate)
+      });
     }
     return results;
   })();
@@ -124,19 +132,21 @@ create_metadata = function(entity_id, assert_endpoint, signing_certificates, enc
       '@xmlns:ds': XMLNS.DS,
       '@entityID': entity_id,
       '@validUntil': (new Date(Date.now() + 1000 * 60 * 60)).toISOString(),
-      'md:SPSSODescriptor': {
-        '@protocolSupportEnumeration': 'urn:oasis:names:tc:SAML:1.1:protocol urn:oasis:names:tc:SAML:2.0:protocol',
-        'md:KeyDescriptor': signing_cert_descriptors.concat(encryption_cert_descriptors),
-        'md:SingleLogoutService': {
-          '@Binding': 'urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect',
-          '@Location': assert_endpoint
-        },
-        'md:AssertionConsumerService': {
-          '@Binding': 'urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST',
-          '@Location': assert_endpoint,
-          '@index': '0'
+      'md:SPSSODescriptor': [].concat({
+        '@protocolSupportEnumeration': 'urn:oasis:names:tc:SAML:1.1:protocol urn:oasis:names:tc:SAML:2.0:protocol'
+      }).concat(signing_cert_descriptors).concat(encryption_cert_descriptors).concat([
+        {
+          'md:SingleLogoutService': {
+            '@Binding': 'urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect',
+            '@Location': assert_endpoint
+          },
+          'md:AssertionConsumerService': {
+            '@Binding': 'urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST',
+            '@Location': assert_endpoint,
+            '@index': '0'
+          }
         }
-      }
+      ])
     }
   }).end();
 };
@@ -221,7 +231,7 @@ sign_request = function(saml_request, private_key, relay_state, response) {
     samlQueryString.RelayState = relay_state;
   }
   samlQueryString.SigAlg = 'http://www.w3.org/2001/04/xmldsig-more#rsa-sha256';
-  samlQueryString.Signature = sign.sign(format_pem(private_key, 'PRIVATE KEY'), 'base64');
+  samlQueryString.Signature = sign.sign(format_pem(private_key, 'RSA PRIVATE KEY'), 'base64');
   return samlQueryString;
 };
 
@@ -324,7 +334,7 @@ decrypt_assertion = function(dom, private_keys, cb) {
     errors = [];
     return async.eachOfSeries(private_keys, function(private_key, index, cb_e) {
       return xmlenc.decrypt(encrypted_assertion, {
-        key: format_pem(private_key, 'PRIVATE KEY')
+        key: format_pem(private_key, 'RSA PRIVATE KEY')
       }, function(err, result) {
         if (err != null) {
           if (err != null) {
@@ -365,7 +375,7 @@ check_saml_signature = function(_xml, certificate) {
       return format_pem(certificate, 'CERTIFICATE');
     }
   };
-  sig.loadSignature(signature[0]);
+  sig.loadSignature(signature[0].toString());
   valid = sig.checkSignature(xml);
   if (valid) {
     return get_signed_data(doc, sig);
@@ -681,26 +691,21 @@ parse_authn_response = function(saml_response, sp_private_keys, idp_certificates
       }
       return cb_wf(null, decrypted_assertion);
     }, function(validated_assertion, cb_wf) {
-      var assertion_attributes, err, session_info;
-      try {
-        session_info = get_session_info(validated_assertion, require_session_index);
-        user.name_id = get_name_id(validated_assertion);
-        user.session_index = session_info.index;
-        if (session_info.not_on_or_after != null) {
-          user.session_not_on_or_after = session_info.not_on_or_after;
-        }
-        assertion_attributes = parse_assertion_attributes(validated_assertion);
-        user = _.extend(user, pretty_assertion_attributes(assertion_attributes));
-        user = _.extend(user, {
-          attributes: assertion_attributes
-        });
-        return cb_wf(null, {
-          user: user
-        });
-      } catch (error) {
-        err = error;
-        return cb_wf(err);
+      var assertion_attributes, session_info;
+      session_info = get_session_info(validated_assertion, require_session_index);
+      user.name_id = get_name_id(validated_assertion);
+      user.session_index = session_info.index;
+      if (session_info.not_on_or_after != null) {
+        user.session_not_on_or_after = session_info.not_on_or_after;
       }
+      assertion_attributes = parse_assertion_attributes(validated_assertion);
+      user = _.extend(user, pretty_assertion_attributes(assertion_attributes));
+      user = _.extend(user, {
+        attributes: assertion_attributes
+      });
+      return cb_wf(null, {
+        user: user
+      });
     }
   ], cb);
 };
