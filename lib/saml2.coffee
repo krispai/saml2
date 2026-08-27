@@ -2,11 +2,10 @@ _             = require 'underscore'
 async         = require 'async'
 crypto        = require 'crypto'
 debug         = require('debug') 'saml2'
-{parseString} = require 'xml2js'
 url           = require 'url'
 util          = require 'util'
-xmlbuilder    = require 'xmlbuilder'
-xmlcrypto     = require 'xml-crypto'
+xmlbuilder    = require 'xmlbuilder2'
+xpath     = require 'xpath'
 xmldom        = require '@xmldom/xmldom'
 xmlenc        = require 'xml-encryption'
 zlib          = require 'zlib'
@@ -28,8 +27,7 @@ class SAMLError extends Error
 # request.
 create_authn_request = (issuer, assert_endpoint, destination, force_authn, context, nameid_format) ->
   if context?
-    context_element = _(context.class_refs).map (class_ref) -> 'saml:AuthnContextClassRef': class_ref
-    context_element.push '@Comparison': context.comparison
+    context_element = { 'saml:AuthnContextClassRef': context.class_refs, '@Comparison': context.comparison }
 
   id = '_' + crypto.randomBytes(21).toString('hex')
   xml = xmlbuilder.create
@@ -53,19 +51,28 @@ create_authn_request = (issuer, assert_endpoint, destination, force_authn, conte
 
 # Adds an embedded signature to a previously generated AuthnRequest
 sign_authn_request = (xml, private_key, options) ->
-  signer = new SignedXml null, options
-  signer.addReference "//*[local-name(.)='AuthnRequest']", ['http://www.w3.org/2000/09/xmldsig#enveloped-signature','http://www.w3.org/2001/10/xml-exc-c14n#']
-  signer.signingKey = private_key
+  signer = new SignedXml options
+  signer.addReference({
+    xpath: "//*[local-name(.)='AuthnRequest']",
+    transforms: ['http://www.w3.org/2000/09/xmldsig#enveloped-signature', 'http://www.w3.org/2001/10/xml-exc-c14n#']
+    digestAlgorithm: "http://www.w3.org/2001/04/xmlenc#sha256"
+  })
+  signer.privateKey = private_key
+  signer.canonicalizationAlgorithm = 'http://www.w3.org/2001/10/xml-exc-c14n#';
+  signer.signatureAlgorithm = options?.signatureAlgorithm || 'http://www.w3.org/2001/04/xmldsig-more#rsa-sha256'
+
   signer.computeSignature xml
+
+
   return signer.getSignedXml()
 
 # Creates metadata and returns it as a string of XML. The metadata has one POST assertion endpoint.
 create_metadata = (entity_id, assert_endpoint, signing_certificates, encryption_certificates) ->
   signing_cert_descriptors = for signing_certificate in signing_certificates or []
-    {'md:KeyDescriptor': certificate_to_keyinfo('signing', signing_certificate)}
+    certificate_to_keyinfo('signing', signing_certificate)
 
   encryption_cert_descriptors = for encryption_certificate in encryption_certificates or []
-    {'md:KeyDescriptor': certificate_to_keyinfo('encryption', encryption_certificate)}
+    certificate_to_keyinfo('encryption', encryption_certificate)
 
   xmlbuilder.create
     'md:EntityDescriptor':
@@ -73,19 +80,16 @@ create_metadata = (entity_id, assert_endpoint, signing_certificates, encryption_
       '@xmlns:ds': XMLNS.DS
       '@entityID': entity_id
       '@validUntil': (new Date(Date.now() + 1000 * 60 * 60)).toISOString()
-      'md:SPSSODescriptor': []
-        .concat {'@protocolSupportEnumeration': 'urn:oasis:names:tc:SAML:1.1:protocol urn:oasis:names:tc:SAML:2.0:protocol'}
-        .concat signing_cert_descriptors
-        .concat encryption_cert_descriptors
-        .concat [
-          'md:SingleLogoutService':
-            '@Binding': 'urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect'
-            '@Location': assert_endpoint
-          'md:AssertionConsumerService':
-            '@Binding': 'urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST'
-            '@Location': assert_endpoint
-            '@index': '0'
-        ]
+      'md:SPSSODescriptor':
+        '@protocolSupportEnumeration': 'urn:oasis:names:tc:SAML:1.1:protocol urn:oasis:names:tc:SAML:2.0:protocol'
+        'md:KeyDescriptor': signing_cert_descriptors.concat(encryption_cert_descriptors)
+        'md:SingleLogoutService':
+          '@Binding': 'urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect'
+          '@Location': assert_endpoint
+        'md:AssertionConsumerService':
+          '@Binding': 'urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST'
+          '@Location': assert_endpoint
+          '@index': '0'
   .end()
 
 # Creates a LogoutRequest and returns it as a string of xml.
@@ -243,52 +247,39 @@ decrypt_assertion = (dom, private_keys, cb) ->
 # This checks the signature of a saml document and returns either array containing the signed data if valid, or null
 # if the signature is invalid. Comparing the result against null is NOT sufficient for signature checks as it doesn't
 # verify the signature is signing the important content, nor is it preventing the parsing of unsigned content.
-check_saml_signature = (_xml, certificate) ->
-  # xml-crypto requires that whitespace is normalized as such:
-  # https://github.com/yaronn/xml-crypto/commit/17f75c538674c0afe29e766b058004ad23bd5136#diff-5dfe38baf287dcf756a17c2dd63483781b53bf4b669e10efdd01e74bcd8e780aL69
-  xml = _xml.replace(/\r\n?/g, '\n')
+check_saml_signature = (xml, certificate) ->
   doc = (new xmldom.DOMParser()).parseFromString(xml)
 
-  # Find the correct section of the XML doc to check the signature for
-  maybe_req = xmlcrypto.xpath(doc, "//*[local-name(.)='AuthnRequest']")
-  maybe_req = maybe_req && maybe_req[0]
-  maybe_resp = xmlcrypto.xpath(doc, "//*[local-name(.)='Response']")
-  maybe_resp = maybe_resp && maybe_resp[0]
-  maybe_assert = xmlcrypto.xpath(doc, "//*[local-name(.)='Assertion']")
-  maybe_assert = maybe_assert && maybe_assert[0]
-  to_check = maybe_req || maybe_resp || maybe_assert
-  signature = xmlcrypto.xpath(to_check, "./*[local-name(.)='Signature' and namespace-uri(.)='http://www.w3.org/2000/09/xmldsig#']")
+  # xpath failed to capture <ds:Signature> nodes of direct descendents of the root.
+  # Call documentElement to explicitly start from the root element of the document.
+  signature = xpath.select("./*[local-name(.)='Signature' and namespace-uri(.)='http://www.w3.org/2000/09/xmldsig#']", doc.documentElement)
   return null unless signature.length is 1
-  sig = new xmlcrypto.SignedXml()
-  sig.keyInfoProvider = getKey: -> format_pem(certificate, 'CERTIFICATE')
-  sig.loadSignature signature[0].toString()
-  valid = sig.checkSignature xml
-  if valid
-    return get_signed_data(doc, sig)
-  else
-    return null
+  sig = new SignedXml(
+    {
+      publicCert: format_pem(certificate, 'CERTIFICATE')
+    }
+  )
+  # sig.keyInfoProvider = getKey: -> format_pem(certificate, 'CERTIFICATE')
+  sig.loadSignature signature[0]
+  try
+    valid = sig.checkSignature xml
+    if valid
+      return get_signed_data(doc, sig)
+    else
+      return null
+  catch e
+    # temporary hack
+    if (e.message.indexOf("invalid signature") != -1)
+      return null; # returns null for incorrect signature
+    else
+      throw e; # throw back the error
+
 
 # Gets the data that is actually signed according to xml-crypto. This function should mirror the way xml-crypto finds
 # elements for security reasons.
+# deprecate
 get_signed_data = (doc, sig) ->
-  _.map sig.references, (ref) ->
-    uri = ref.uri
-    if uri[0] is '#'
-      uri = uri.substring(1)
-
-    elem = []
-    if uri is ""
-      elem = xmlcrypto.xpath(doc, "//*")
-    else
-      for idAttribute in ["Id", "ID"]
-        elem = xmlcrypto.xpath(doc, "//*[@*[local-name(.)='" + idAttribute + "']='" + uri + "']")
-        if elem.length > 0
-          break
-
-    unless elem.length > 0
-      throw new Error("Invalid signature; must be a reference to '#{ref.uri}'")
-    sig.getCanonXml ref.transforms, elem[0], { inclusiveNamespacesPrefixList: ref.inclusiveNamespacesPrefixList }
-
+  return sig.getSignedReferences(); # use new API
 # Takes in an xml @dom of an object containing a SAML Response and returns an object containing the Destination and
 # InResponseTo attributes of the Response if present. It will throw an error if the Response is missing or does not
 # appear to be valid.
@@ -364,8 +355,8 @@ parse_assertion_attributes = (dom) ->
     attribute_name = get_attribute_value attribute, 'Name'
     throw new Error("Invalid attribute without name") unless attribute_name?
     attribute_values = attribute.getElementsByTagNameNS(XMLNS.SAML, 'AttributeValue')
-    assertion_attributes[attribute_name] = _(attribute_values).map (attribute_value) ->
-      attribute_value.childNodes[0]?.data or ''
+    assertion_attributes[attribute_name] = _.map(attribute_values, (attribute_value) ->
+      attribute_value.childNodes[0]?.data or '')
   assertion_attributes
 
 # Takes in an object containing SAML Assertion Attributes and returns an object with certain common attributes changed
@@ -392,8 +383,7 @@ pretty_assertion_attributes = (assertion_attributes) ->
     "http://schemas.microsoft.com/ws/2008/06/identity/claims/primarysid": "primary_sid"
     "http://schemas.microsoft.com/ws/2008/06/identity/claims/windowsaccountname": "windows_account_name"
 
-  _(assertion_attributes)
-    .chain()
+  _.chain(assertion_attributes)
     .pairs()
     .filter(([k, v]) -> (claim_map[k]? and v.length > 0))
     .map(([k, v]) -> [claim_map[k], v[0]])
@@ -501,16 +491,19 @@ parse_authn_response = (saml_response, sp_private_keys, idp_certificates, allow_
       return cb_wf null, decrypted_assertion
     (validated_assertion, cb_wf) ->
       # Populate attributes
-      session_info = get_session_info validated_assertion, require_session_index
-      user.name_id = get_name_id validated_assertion
-      user.session_index = session_info.index
-      if session_info.not_on_or_after?
-        user.session_not_on_or_after = session_info.not_on_or_after
+      try
+        session_info = get_session_info validated_assertion, require_session_index
+        user.name_id = get_name_id validated_assertion
+        user.session_index = session_info.index
+        if session_info.not_on_or_after?
+          user.session_not_on_or_after = session_info.not_on_or_after
 
-      assertion_attributes = parse_assertion_attributes validated_assertion
-      user = _.extend user, pretty_assertion_attributes(assertion_attributes)
-      user = _.extend user, attributes: assertion_attributes
-      cb_wf null, { user }
+        assertion_attributes = parse_assertion_attributes validated_assertion
+        user = _.extend user, pretty_assertion_attributes(assertion_attributes)
+        user = _.extend user, attributes: assertion_attributes
+        cb_wf null, { user }
+      catch err
+        return cb_wf err
   ], cb
 
 parse_logout_request = (dom) ->
@@ -548,7 +541,7 @@ module.exports.ServiceProvider =
       @alt_private_keys = [].concat(@alt_private_keys or [])
       @alt_certs = [].concat(@alt_certs or [])
 
-      @shared_options = _(options).pick(
+      @shared_options = _.pick(options,
         "force_authn", "auth_context", "nameid_format", "sign_get_request", "allow_unencrypted_assertion", "audience", "notbefore_skew")
 
     # Returns:
@@ -570,7 +563,7 @@ module.exports.ServiceProvider =
           return cb ex
         delete uri.search # If you provide search and query search overrides query :/
         if options.sign_get_request
-          _(uri.query).extend sign_request(deflated.toString('base64'), @private_key, options.relay_state)
+          _.extend(uri.query, sign_request(deflated.toString('base64'), @private_key, options.relay_state))
         else
           uri.query.SAMLRequest = deflated.toString 'base64'
           uri.query.RelayState = options.relay_state if options.relay_state?
@@ -624,7 +617,7 @@ module.exports.ServiceProvider =
 
       async.waterfall [
         (cb_wf) ->
-          raw = new Buffer(options.request_body.SAMLResponse or options.request_body.SAMLRequest, 'base64')
+          raw = Buffer.from(options.request_body.SAMLResponse or options.request_body.SAMLRequest, 'base64')
 
           # Inflate response for redirect requests before parsing it.
           if (options.get_request)
